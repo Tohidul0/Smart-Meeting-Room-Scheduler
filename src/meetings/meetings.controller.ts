@@ -1,4 +1,3 @@
-
 import {
   Body,
   Controller,
@@ -6,6 +5,7 @@ import {
   HttpStatus,
   Post,
 } from '@nestjs/common';
+import { ApiBody, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   SchedulerService,
@@ -14,6 +14,7 @@ import {
 } from '../scheduler/scheduler.service';
 import { MeetingRequestDto } from './dto/create-meeting.dto';
 
+@ApiTags('Meetings')
 @Controller('meetings')
 export class MeetingsController {
   constructor(
@@ -22,18 +23,37 @@ export class MeetingsController {
   ) {}
 
   @Post('find-optimal')
+  @ApiOperation({
+    summary: 'Find the optimal meeting room and time slot',
+    description:
+      'Analyzes all available meeting rooms and existing bookings to recommend the best fit based on capacity, equipment, cost, and priority.',
+  })
+  @ApiBody({ type: MeetingRequestDto })
+  @ApiResponse({
+    status: 200,
+    description: 'Optimal meeting recommendation found successfully.',
+  })
+  @ApiResponse({ status: 400, description: 'Invalid input data.' })
+  @ApiResponse({ status: 404, description: 'No suitable meeting room found.' })
   async findOptimal(@Body() body: MeetingRequestDto) {
-    // fetch rooms and relevant bookings window (preferred +- flexibility + duration)
+    if (!body.preferredStartTime) {
+      throw new HttpException(
+        'preferredStartTime is required',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
     const preferred = new Date(body.preferredStartTime);
-    const windowStart = new Date(
-      preferred.getTime() -
-        Math.max(60, body.flexibility || 0) * 60 * 1000 -
-        60 * 60 * 1000,
-    ); 
-    const windowEnd = new Date(
-      preferred.getTime() +
-        (Math.max(60, body.flexibility || 0) + body.duration + 60) * 60 * 1000,
-    );
+    if (isNaN(preferred.getTime())) {
+      throw new HttpException(
+        'Invalid preferredStartTime format. Must be ISO string (e.g. 2025-11-02T15:00:00Z)',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const flexibility = Math.max(60, body.flexibility || 0);
+    const windowStart = new Date(preferred.getTime() - (flexibility + 60) * 60 * 1000);
+    const windowEnd = new Date(preferred.getTime() + (flexibility + body.duration + 60) * 60 * 1000);
 
     const rooms = await this.prisma.meetingRoom.findMany();
     const bookings = await this.prisma.booking.findMany({
@@ -46,33 +66,43 @@ export class MeetingsController {
 
     const normalizedBookings = bookings.map((b) => ({
       ...b,
-      startTime:
-        b.startTime instanceof Date ? b.startTime.toISOString() : b.startTime,
+      startTime: b.startTime instanceof Date ? b.startTime.toISOString() : b.startTime,
       endTime: b.endTime instanceof Date ? b.endTime.toISOString() : b.endTime,
     }));
 
     return this.scheduler.findOptimalMeeting(
-      body,
+      body as unknown as MeetingRequest,
       normalizedBookings as Booking[],
       rooms,
     );
   }
 
   @Post()
+  @ApiOperation({
+    summary: 'Create a new meeting booking',
+    description:
+      'Creates a tentative meeting booking after validating conflicts, capacity, and equipment requirements.',
+  })
+  @ApiBody({
+    schema: {
+      example: {
+        roomId: '53c00fc0-552d-4a19-b9c1-c0fed1e43604',
+        startTime: '2025-11-02T16:00:00Z',
+        endTime: '2025-11-02T17:00:00Z',
+        duration: 60,
+        attendees: ['alice', 'bob'],
+        requiredEquip: ['projector'],
+        organizer: 'd09eb116-c6a0-4b0f-b6f6-5d8b93e5d7cb',
+        priority: 'high',
+      },
+    },
+  })
+  @ApiResponse({ status: 201, description: 'Meeting booked successfully.' })
+  @ApiResponse({
+    status: 409,
+    description: 'Room not available for requested time (conflict).',
+  })
   async createBooking(@Body() payload: any) {
-    /**
-     * We need to:
-     * 1) Re-check availability within a transaction
-     * 2) Create booking with status 'tentative'
-     * 3) Return booking
-     *
-     * NOTE: Prisma doesn't support row-level SELECT ... FOR UPDATE across arbitrary sets easily.
-     * For production use you may use:
-     * - a locking table/row per room (UPDATE lock) or
-     * - Redis lock (recommended)
-     *
-     * Here we do a transactional check->insert to reduce race window.
-     */
     const {
       roomId,
       startTime,
@@ -83,12 +113,12 @@ export class MeetingsController {
       organizer,
       priority,
     } = payload;
+
     const start = new Date(startTime);
     const end = new Date(endTime);
     const buf = 15 * 60 * 1000;
 
     return await this.prisma.$transaction(async (tx) => {
-      // check conflicts for this room considering buffer
       const conflict = await tx.booking.findFirst({
         where: {
           roomId,
@@ -107,7 +137,6 @@ export class MeetingsController {
         );
       }
 
-      // capacity & equipment check on room
       const room = await tx.meetingRoom.findUnique({ where: { id: roomId } });
       if (!room)
         throw new HttpException('Room not found', HttpStatus.NOT_FOUND);
